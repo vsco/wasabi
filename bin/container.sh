@@ -20,7 +20,9 @@ cassandra=cassandra:2.1
 mysql=mysql:5.6
 docker_network=${project}_nw
 verify_default=false
+migration_default=false
 sleep_default=3
+profile_default=development
 red=`tput setaf 9`
 green=`tput setaf 10`
 reset=`tput sgr0`
@@ -33,9 +35,11 @@ ${green}
 usage: `basename ${0}` [options] [commands]
 
 options:
-  -v | --verify [ true | false ]         : verify installation configuration; default: ${verify_default}
-  -s | --sleep [ sleep-time ]            : sleep/wait time in seconds; default: ${sleep_default}
-  -h | --help                            : help message
+  -v | --verify [ true | false ]    : verify installation configuration; default: ${verify_default}
+  -m | --migration [ true | false ] : refresh cassandra migration scripts; default: ${migration_default}
+  -p | --profile [profile]          : build profile; default: ${profile_default}
+  -s | --sleep [ sleep-time ]       : sleep/wait time in seconds; default: ${sleep_default}
+  -h | --help                       : help message
 
 commands:
   start[:wasabi,cassandra,mysql,docker]  : start all, wasabi, cassandra, mysql, docker
@@ -50,7 +54,7 @@ EOF
 }
 
 fromPom() {
-    mvn -f $1/pom.xml -P $2 help:evaluate -Dexpression=$3 | sed -n -e '/^\[.*\]/ !{ p; }'
+    mvn ${WASABI_MAVEN} -f $1/pom.xml -P $2 help:evaluate -Dexpression=$3 | sed -n -e '/^\[.*\]/ !{ p; }'
 }
 
 beerMe() {
@@ -69,11 +73,20 @@ beerMe() {
 }
 
 start_docker() {
-  docker ps ${project} >/dev/null 2>&1 || (open /Applications/Docker.app; beerMe 10)
+  docker ps >/dev/null 2>&1
+  [[ $? != 0 && "${WASABI_OS}" == "${WASABI_OSX}" ]] && open /Applications/Docker.app
+
+  while :; do
+    docker ps >/dev/null 2>&1
+    [[ $? = 0 ]] && break
+    beerMe 3
+  done
 }
 
 stop_docker() {
-  osascript -e 'quit app "Docker"'
+  if [ "${WASABI_OS}" == "${WASABI_OSX}" ]; then
+    osascript -e 'quit app "Docker"'
+  fi
 }
 
 start_container() {
@@ -131,18 +144,36 @@ remove_container() {
 start_wasabi() {
   start_docker
 
-  id=$(fromPom modules/main development application.name)
-  wcip=$(docker inspect --format "{{ .NetworkSettings.Networks.${docker_network}.IPAddress }}" ${project}-cassandra)
-  wmip=$(docker inspect --format "{{ .NetworkSettings.Networks.${docker_network}.IPAddress }}" ${project}-mysql)
+  id=$(fromPom modules/main ${profile} application.name)
+
+  CASSANDRA_CONTAINER_NAME=${CASSANDRA_CONTAINER:-${project}-cassandra}
+  IS_CONTAINER=`docker inspect -f {{.State.Running}} $CASSANDRA_CONTAINER_NAME`
+  if [ "$IS_CONTAINER" = true ] ; then
+    wcip=$(docker inspect --format "{{ .NetworkSettings.Networks.${docker_network}.IPAddress }}" ${CASSANDRA_CONTAINER_NAME})
+  elif [ -z ${NODE_HOST} ]; then
+    echo "[ERROR] Cassandra container must be running or NODE_HOST environment variable must be set"
+    exit 1;
+  else
+    wcip=${NODE_HOST}
+  fi
+
+  MYSQL_CONTAINER_NAME=${MYSQL_CONTAINER:-${project}-mysql}
+  IS_CONTAINER=`docker inspect -f {{.State.Running}} $MYSQL_CONTAINER_NAME`
+  if [ "$IS_CONTAINER" = true ] ; then
+    wmip=$(docker inspect --format "{{ .NetworkSettings.Networks.${docker_network}.IPAddress }}" ${MYSQL_CONTAINER_NAME})
+  elif [ -z ${MYSQL_HOST} ]; then
+    echo "[ERROR] Mysql container must be running or MYSQL_HOST environment variable must be set"
+    exit 1;
+  else
+    wmip=${MYSQL_HOST}
+  fi
 
   remove_container ${project}-main
 
-  if [ "${verify}" = true ] || ! [ docker inspect ${project}-main >/dev/null 2>&1 ]; then
-    echo "${green}${project}: building${reset}"
+  echo "${green}${project}: building${reset}"
 
-#    sed -i -e "s|\(http://\)localhost\(:8080\)|\1${mip}\2|g" modules/main/target/${id}/content/ui/dist/scripts/config.js 2>/dev/null;
-    docker build -t ${project}-main:${USER}-$(date +%s) -t ${project}-main:latest modules/main/target/${id}
-  fi
+# sed -i -e "s|\(http://\)localhost\(:8080\)|\1${mip}\2|g" modules/main/target/${id}/content/ui/dist/scripts/config.js 2>/dev/null;
+  docker build -t ${project}-main:${USER}-$(date +%s) -t ${project}-main:latest modules/main/target/${id}
 
   echo "${green}${project}: starting${reset}"
 
@@ -155,19 +186,7 @@ start_wasabi() {
 
   echo -ne "${green}chill'ax ${reset}"
 
-  wget -q --spider --tries=20 --waitretry=3 http://localhost:8080/api/v1/ping
-  [ $? -ne 0 ] && usage "unable to start" 1
-
-  cat << EOF
-
-${green}
-wasabi is operational:
-
-  ui: % open http://localhost:8080     note: sign in as admin/admin
-  ping: % curl -i http://localhost:8080/api/v1/ping
-  debug: attach to localhost:8180
-${reset}
-EOF
+  status
 }
 
 start_cassandra() {
@@ -175,6 +194,36 @@ start_cassandra() {
   start_container ${project}-cassandra ${cassandra} "--privileged=true -p 9042:9042 -p 9160:9160"
 
   [ "${verify}" = true ] && console_cassandra
+
+  CONTAINER_NAME=${CASSANDRA_CONTAINER:-${project}-cassandra}
+  IS_CONTAINER=`docker inspect -f {{.State.Running}} $CONTAINER_NAME`
+
+  if [ "$IS_CONTAINER" = true ] ; then
+    echo "${green}${project}: [Start] creating keyspace and migration schemas${reset}"
+    CURRENT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+
+    docker inspect wasabi-keyspace >/dev/null 2>&1
+    IS_IMAGE_AVAILABLE=$?
+    if [ "${migration}" = true ] || ! [ ${IS_IMAGE_AVAILABLE} -eq 0 ]; then
+        echo "${green}${project}: [Start] Building wasabi keyspace image${reset}"
+        docker build --force-rm --no-cache -t wasabi-keyspace:latest -f "${CURRENT_DIR}/./docker/cqlsh.docker" "${CURRENT_DIR}/./docker/"
+    fi
+    docker run -it --rm -e CASSANDRA_KEYSPACE_PREFIX=${project} -e CQLSH_HOST=${project}-cassandra -e CASSANDRA_PORT=9042 --net=${docker_network} --name wasabi_create_keyspace wasabi-keyspace
+
+    docker inspect wasabi-migration >/dev/null 2>&1
+    IS_IMAGE_AVAILABLE=$?
+    if [ "${migration}" = true ] || ! [ ${IS_IMAGE_AVAILABLE} -eq 0 ]; then
+        echo "${green}${project}: [Start] Building wasabi migration image${reset}"
+        docker build --force-rm --no-cache -t wasabi-migration:latest -f "${CURRENT_DIR}/./docker/migration.docker" "${CURRENT_DIR}/../"
+    fi
+    docker run -it --rm -e CQLSH_HOST=${project}-cassandra -e CASSANDRA_PORT=9042 --net=${docker_network} --name wasabi_migration wasabi-migration
+    echo "${green}${project}: [DONE] creating keyspace and migration schemas${reset}"
+  else
+    echo "[ERROR] Failed to start cassandra container, please check the logs"
+    exit 1;
+  fi
+
+
 }
 
 console_cassandra() {
@@ -214,10 +263,37 @@ console_mysql() {
 }
 
 status() {
+  wget -q --spider --tries=20 --waitretry=3 http://localhost:8080/api/v1/ping
+  [ $? -ne 0 ] && usage "not started" 1
+
+  cat << EOF
+
+${green}
+wasabi is operational:
+
+  ui: % open http://localhost:8080     note: sign in as admin/admin
+  ping: % curl -i http://localhost:8080/api/v1/ping
+  debug: attach to localhost:8180
+${reset}
+EOF
+
   docker ps 2>/dev/null
 }
 
-optspec=":f:p:v:s:h-:"
+exec_commands_simple() {
+  prefix=$1
+  commands=$(echo $2 | cut -d ':' -f 2)
+  (IFS=','; for command in ${commands}; do ${prefix}${command}; done)
+}
+
+exec_commands_project() {
+  prefix=$1
+  commands=$(echo $2 | cut -d ':' -f 2)
+  (IFS=','; for command in ${commands}; do ${prefix} ${project}-${command/${project}/main}; done)
+}
+
+
+optspec=":f:p:v:m:s:h-:"
 
 while getopts "${optspec}" opt; do
   case "${opt}" in
@@ -225,13 +301,19 @@ while getopts "${optspec}" opt; do
       case "${OPTARG}" in
         verify) verify="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ));;
         verify=*) verify="${OPTARG#*=}";;
+        migration) migration="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ));;
+        migration=*) migration="${OPTARG#*=}";;
         sleep) sleep="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ));;
         sleep=*) sleep="${OPTARG#*=}";;
+        profile) profile="${!OPTIND}"; OPTIND=$(( ${OPTIND} + 1 ));;
+        profile=*) profile="${OPTARG#*=}";;
         help) usage;;
         *) [ "${OPTERR}" = 1 ] && [ "${optspec:0:1}" != ":" ] && echo "unknown option --${OPTARG}";;
       esac;;
     v) verify=${OPTARG};;
+    m) migration=${OPTARG};;
     s) sleep=${OPTARG};;
+    p) profile=${OPTARG};;
     h) usage;;
     :) usage "option -${OPTARG} requires an argument" 1;;
     \?) [ "${OPTERR}" != 1 ] || [ "${optspec:0:1}" = ":" ] && usage "unknown option -${OPTARG}" 1;;
@@ -239,25 +321,23 @@ while getopts "${optspec}" opt; do
 done
 
 verify=${verify:=${verify_default}}
+migration=${migration:=${migration_default}}
 sleep=${sleep:=${sleep_default}}
+profile=${profile:=${profile_default}}
 
 [[ $# -eq 0 ]] && usage
 
 for command in ${@:$OPTIND}; do
   case "${command}" in
-    start) command="start:cassandra,mysql,wasabi";&
-    start:*) commands=$(echo ${command} | cut -d':' -f 2)
-      (IFS=','; for command in ${commands}; do start_${command}; done);;
-    stop) command="stop:main,cassandra,mysql";&
-    stop:*) commands=$(echo ${command} | cut -d':' -f 2)
-      (IFS=','; for command in ${commands}; do stop_container ${project}-${command/${project}/main}; done);;
-    console) command="console:cassandra,mysql";&
-    console:*) commands=$(echo ${command} | cut -d':' -f 2)
-      (IFS=','; for command in ${commands}; do console_${command}; done);;
+    start) exec_commands_simple start_ cassandra,mysql,wasabi;;
+    start:*) exec_commands_simple start_ ${command};;
+    stop) exec_commands_project stop_container main,cassandra,mysql;;
+    stop:*) exec_commands_project stop_container ${command};;
+    console) exec_commands_simple console_ cassandra,mysql;;
+    console:*) exec_commands_simple console_ ${command};;
     status) status;;
-    remove) command="remove:wasabi,cassandra,mysql";&
-    remove:*) commands=$(echo ${command} | cut -d':' -f 2)
-      (IFS=','; for command in ${commands}; do remove_container ${project}-${command/${project}/main}; done);;
+    remove) exec_commands_project remove_container wasabi,cassandra,mysql;;
+    remove:*) exec_commands_project remove_container ${command};;
     "") usage "unknown command: ${command}" 1;;
     *) usage "unknown command: ${command}" 1;;
   esac
