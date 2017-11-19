@@ -86,6 +86,14 @@
                 <metrics.jmx.enabled>true</metrics.jmx.enabled>
             </properties>
         </profile>
+        <profile>
+            <id>builddocker</id>
+            <properties>
+                <metrics.jmx.enabled>true</metrics.jmx.enabled>
+                <application.daemon.enable>false</application.daemon.enable>
+            </properties>
+        </profile>
+
     </profiles>
 
     <dependencies>
